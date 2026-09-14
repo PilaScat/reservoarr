@@ -29,6 +29,9 @@ stats  -> /data/scripts/logs/delaybuf.log
 Dispatcharr stops the channel by signalling THIS pid only: on SIGTERM we
 reap ffmpeg; on SIGKILL the broken pipes make ffmpeg exit on its own.
 """
+import fcntl
+import json
+import math
 import os
 import re
 import signal
@@ -97,6 +100,11 @@ FFMPEG_CMD = [
     "-c:a", "ac3", "-b:a", "192k", "-ac", "2",
     "-f", "mpegts", "-muxdelay", "0", "-muxpreload", "0", "pipe:1",
 ]
+TS_CHANNEL = re.sub(r"[^A-Za-z0-9_-]", "", os.getenv("RESV_TS_CHANNEL", ""))[:64]
+TS_SEAM_S = 1.0
+TS_SAVE_EVERY_S = 2.0
+TS_MAX_LEAD_S = 30.0
+RELAY_DRAIN_S = 2.0
 
 buf = deque()
 buf_bytes = 0
@@ -163,6 +171,114 @@ def log(msg, stderr=True, file=True):
     if stderr:
         sys.stderr.write(f"[delaybuf] {msg}\n")
         sys.stderr.flush()
+
+
+def ffmpeg_cmd(ts_offset=None):
+    if ts_offset is None:
+        return FFMPEG_CMD
+    return [*FFMPEG_CMD[:-1], "-output_ts_offset", f"{ts_offset:.6f}", FFMPEG_CMD[-1]]
+
+
+def timeline_path():
+    return os.path.join(LOG_DIR, f"pts-{TS_CHANNEL}.json")
+
+
+def timeline_projection(path, now):
+    try:
+        with open(path) as f:
+            state = json.load(f)
+        end, wall = float(state["end"]), float(state["wall"])
+    except (OSError, ValueError, KeyError, TypeError, OverflowError):
+        return None
+    if not (math.isfinite(end) and math.isfinite(wall)):
+        return None
+    projected = end + max(now - wall, 0.0)
+    return projected if projected - now < TS_WRAP_S / 2 else None
+
+
+def pes_pts(buf_, i):
+    if not buf_[i + 1] & 0x40 or not buf_[i + 3] & 0x10:
+        return None
+    p = i + 4
+    if buf_[i + 3] & 0x20:
+        p += 1 + buf_[i + 4]
+    if p + 14 > i + 188 or buf_[p:p + 3] != b"\x00\x00\x01" or not buf_[p + 7] & 0x80:
+        return None
+    b = buf_[p + 9:p + 14]
+    return ((b[0] >> 1) & 0x07) << 30 | b[1] << 22 | (b[2] >> 1) << 15 | b[3] << 7 | b[4] >> 1
+
+
+class Timeline:
+    def __init__(self, path, now):
+        self.path = path
+        projected = timeline_projection(path, now)
+        self.origin = now if projected is None else max(now, projected + TS_SEAM_S)
+        self.offset = self.origin % TS_WRAP_S
+        self.started = time.monotonic()
+        self.high = None
+        self.rejected = 0
+        self.saved_at = float("-inf")
+
+    def observe(self, pts, now=None):
+        expected = self.origin + ((time.monotonic() if now is None else now) - self.started)
+        base = self.origin - self.offset + pts / 90000.0
+        seconds = base + round((expected - base) / TS_WRAP_S) * TS_WRAP_S
+        if seconds > expected + TS_MAX_LEAD_S:
+            self.rejected += 1
+            return
+        if self.high is None or seconds > self.high:
+            self.high = seconds
+
+    def end(self):
+        return self.high
+
+    def save(self, now):
+        self.saved_at = time.monotonic()
+        end = self.end()
+        if end is None:
+            return
+        try:
+            with open(f"{self.path}.lock", "a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                projected = timeline_projection(self.path, now)
+                if projected is not None and projected > end:
+                    return
+                tmp = f"{self.path}.{os.getpid()}"
+                with open(tmp, "w") as f:
+                    json.dump({"end": end, "wall": now}, f)
+                os.replace(tmp, self.path)
+        except OSError:
+            pass
+
+
+def stdout_relay(ff, timeline, out=None):
+    out = out or sys.stdout.buffer
+    carry = b""
+    try:
+        while True:
+            chunk = os.read(ff.stdout.fileno(), CHUNK)
+            if not chunk:
+                break
+            out.write(chunk)
+            out.flush()
+            data = carry + chunk
+            i = data.find(0x47)
+            while 0 <= i and i + 188 <= len(data):
+                if data[i] != 0x47:
+                    i = data.find(0x47, i + 1)
+                    continue
+                pts = pes_pts(data, i)
+                if pts is not None:
+                    timeline.observe(pts)
+                i += 188
+            carry = data[i:] if 0 <= i else b""
+    except (BrokenPipeError, OSError, ValueError):
+        pass
+    finally:
+        try:
+            ff.stdout.close()
+        except Exception:
+            pass
 
 
 def ts_sync(buf_, start):
@@ -695,8 +811,16 @@ def main():
             cond.wait(0.5)
     log(f"prefill done: {buf_bytes / 1e6:.1f}MB in {time.monotonic() - t0:.1f}s, releasing stream to ffmpeg")
 
-    ff = subprocess.Popen(FFMPEG_CMD, stdin=subprocess.PIPE, stdout=None, stderr=subprocess.PIPE, bufsize=0)
+    timeline = Timeline(timeline_path(), time.time()) if TS_CHANNEL else None
+    ff = subprocess.Popen(ffmpeg_cmd(timeline.offset if timeline else None), stdin=subprocess.PIPE,
+                          stdout=subprocess.PIPE if timeline else None, stderr=subprocess.PIPE, bufsize=0)
     threading.Thread(target=stderr_watcher, args=(ff,), daemon=True).start()
+    relay = None
+    if timeline:
+        log(f"ts timeline: channel {TS_CHANNEL} starts at {timeline.origin:.3f}s "
+            f"(output offset {timeline.offset:.3f}s)")
+        relay = threading.Thread(target=stdout_relay, args=(ff, timeline), daemon=True)
+        relay.start()
     if STALL_S > 0:
         threading.Thread(target=stall_watchdog, daemon=True).start()
 
@@ -768,6 +892,8 @@ def main():
                 ff.stdin.write(aligned)
                 out_since_stats += len(aligned)
             now = time.monotonic()
+            if timeline and now - timeline.saved_at >= TS_SAVE_EVERY_S:
+                timeline.save(time.time())
             if now - last_stats >= STATS_EVERY_S:
                 orate = out_since_stats / (now - last_stats)
                 src = "pcr" if cush_pcr is not None else "byte"
@@ -827,6 +953,13 @@ def main():
                 ff.kill()
             except Exception:
                 pass
+        if relay:
+            relay.join(timeout=RELAY_DRAIN_S)
+        if timeline:
+            timeline.save(time.time())
+            if timeline.rejected:
+                log(f"ts timeline: ignored {timeline.rejected} output PTS more than "
+                    f"{TS_MAX_LEAD_S:.0f}s ahead of the wall clock")
         log(f"stream wrapper exit (ffmpeg rc={ff.returncode})")
 
 
