@@ -77,6 +77,7 @@ AUDIO_ARGS = {
 AUDIO_CODEC_REQUESTED = os.getenv("RESV_AUDIO_CODEC", "ac3").strip().lower()
 AUDIO_CODEC = AUDIO_CODEC_REQUESTED if AUDIO_CODEC_REQUESTED in AUDIO_ARGS else "ac3"
 AUDIO_FILL_GAPS = os.getenv("RESV_AUDIO_FILL_GAPS", "0") == "1"
+DISCARD_CORRUPT = os.getenv("RESV_DISCARD_CORRUPT", "0") == "1"
 REPLAY_SKIP = os.getenv("RESV_REPLAY_SKIP", "0") == "1"
 REPLAY_MAX_S = float(os.getenv("RESV_REPLAY_MAX_S", "60"))
 REPLAY_HOLD_BYTES = 1024 * 1024
@@ -113,6 +114,7 @@ FFMPEG_CMD = [
     FFMPEG_BIN, "-hide_banner", "-loglevel", "warning",
     *(["-stats"] if FFMPEG_STATS else []),
     "-analyzeduration", "1000000", "-probesize", "500000",
+    *(["-fflags", "+discardcorrupt"] if DISCARD_CORRUPT else []),
     "-i", "pipe:0",
     "-map", "0:v", "-map", "0:a:0",
     "-c:v", "copy", "-bsf:v", "dump_extra=freq=keyframe",
